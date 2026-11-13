@@ -1,0 +1,165 @@
+# Git process helpers: no shell evaluation, force push, reset, or automatic merge.
+. (Join-Path $PSScriptRoot 'github_publish_dependencies.ps1')
+function ConvertTo-PublishArgument([string]$Value) {
+    '"'+[regex]::Replace([regex]::Replace($Value,'(\\*)"','$1$1\"'),'(\\+)$','$1$1')+'"'
+}
+
+function Invoke-PublishGit {
+    param([string]$Root, [string[]]$Arguments, [int[]]$Allowed=@(0))
+    $info=New-Object Diagnostics.ProcessStartInfo
+    $info.FileName=(Get-Command git -ErrorAction Stop).Source
+    $info.Arguments=(@('-C',$Root,'-c','core.quotepath=false')+$Arguments |
+        ForEach-Object { ConvertTo-PublishArgument $_ }) -join ' '
+    $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+    $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+    $info.StandardOutputEncoding=New-Object Text.UTF8Encoding($false)
+    $info.StandardErrorEncoding=New-Object Text.UTF8Encoding($false)
+    $info.EnvironmentVariables['GIT_TERMINAL_PROMPT']='0'
+    $info.EnvironmentVariables['GCM_INTERACTIVE']='Never'
+    $info.EnvironmentVariables['GIT_OPTIONAL_LOCKS']='0'
+    $process=New-Object Diagnostics.Process
+    $process.StartInfo=$info
+    try {
+        [void]$process.Start()
+        $output=$process.StandardOutput.ReadToEndAsync()
+        $errors=$process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $result=[pscustomobject]@{Code=$process.ExitCode;Text=$output.Result.TrimEnd();Error=$errors.Result.TrimEnd()}
+        if($result.Code -notin $Allowed) {
+            throw ('git {0} failed ({1}): {2} {3}' -f ($Arguments -join ' '),$result.Code,$result.Text,$result.Error)
+        }
+        return $result
+    } finally { $process.Dispose() }
+}
+
+function Assert-PublishRemote([string]$Value, [string]$Expected) {
+    if($Expected -match '^released/[A-Za-z0-9_]+$') {
+        $escaped=[regex]::Escape($Expected)
+        if($Value -notmatch ('^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)'+$escaped+'(?:\.git)?/?$')) {
+            throw "Origin does not match the expected GitHub repository: $Expected"
+        }
+    } elseif($Value -cne $Expected) { throw 'Origin does not match the explicit test repository.' }
+}
+
+function Test-PublishLocalOnlyPath([string]$Path) {
+    if($Path -match '^(?:(?:AGENTS(?:_for_Codex)?|CLAUDE|WORKSPACE_RULES|HANDOFF|CODEX_HANDOFF|SELF_CHECK|MANUAL_CLEANUP|DEVELOPMENT_CHECKLIST)\.md|docs/(?:verification|development|internal)/)') { return $true }
+    return $Path -match '^(tmp/|github_push\.local\.psd1$|QualityReport\([^/]+\)\.txt$|build/(?:reports/|logs/|.*\.(?:ini|log)$))'
+}
+
+function Get-PublishDeferredPaths($Target) {
+    if(!$Target.DeferredPattern -and !$Target.ToolScope) { return }
+    $paths=(Invoke-PublishGit $Target.Root @('ls-files','--cached','--others','--exclude-standard','-z')).Text.Split([char]0)
+    $paths | Where-Object {
+        $_ -and (($Target.DeferredPattern -and $_ -match $Target.DeferredPattern) -or
+                 ($Target.ToolScope -and !(Test-ToolPublicationPath $_)))
+    } | Sort-Object -Unique
+}
+
+function Assert-PublishLocalOnlyData($Target) {
+    foreach($path in (Invoke-PublishGit $Target.Root @('ls-files','-z')).Text.Split([char]0)) {
+        if(Test-PublishLocalOnlyPath $path) {
+            throw "Local-only data is tracked in $($Target.Root): $path. Keep the local file and review its Git tracking before publication."
+        }
+    }
+    foreach($path in (Invoke-PublishGit $Target.Root @('ls-files','--others','--exclude-standard','-z')).Text.Split([char]0)) {
+        if(Test-PublishLocalOnlyPath $path) {
+            throw "Local-only data is not ignored in $($Target.Root): $path. Review .gitignore before publication."
+        }
+    }
+}
+
+function Assert-PublishStagedChanges([string]$Root) {
+    # Explicit local-data tracking removals are safe to include. Preserve and
+    # refuse every other pre-existing staged change, including source deletions.
+    $changes=(Invoke-PublishGit $Root @('diff','--cached','--name-status','--no-renames','-z')).Text.Split([char]0)
+    for($i=0;$i+1 -lt $changes.Count;$i+=2) {
+        if($changes[$i] -cne 'D' -or !(Test-PublishLocalOnlyPath $changes[$i+1])) {
+            throw "Existing staged changes must be reviewed/committed before batch publication: $Root. Only local-only tracking removals may remain staged."
+        }
+    }
+}
+
+function Assert-PublishRepository($Target) {
+    $root=(Resolve-Path -LiteralPath $Target.Root -ErrorAction Stop).ProviderPath.TrimEnd('\','/')
+    if((Split-Path -Leaf $root) -cne $Target.Name) { throw "Unexpected repository directory: $root" }
+    Assert-PublishTree $root $root
+    if(!(Test-Path -LiteralPath (Join-Path $root '.git'))) {
+        throw "Git repository is not initialized: $root. Use github_push.bat new for reviewed first-time setup, or recover its existing main/history/origin; no files were pruned."
+    }
+    $actual=(Invoke-PublishGit $root @('rev-parse','--show-toplevel')).Text.Replace('/','\').TrimEnd('\')
+    if($actual -ine $root.Replace('/','\')) { throw "Not an exact repository root: $root" }
+    if((Invoke-PublishGit $root @('symbolic-ref','--short','HEAD')).Text -cne 'main') {
+        throw "Publication requires main (no detached HEAD): $root"
+    }
+    foreach($gitArguments in @(@('remote','get-url','--all','origin'),@('remote','get-url','--push','--all','origin'))) {
+        Assert-PublishRemote (Invoke-PublishGit $root $gitArguments).Text $Target.Remote
+    }
+    if((Invoke-PublishGit $root @('config','--bool','--get','remote.origin.mirror') @(0,1)).Text -eq 'true') {
+        throw "Mirror push configuration is not supported: $root"
+    }
+    foreach($name in @('index.lock','MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge','rebase-apply')) {
+        $path=(Invoke-PublishGit $root @('rev-parse','--git-path',$name)).Text
+        if(![IO.Path]::IsPathRooted($path)) { $path=Join-Path $root $path }
+        if(Test-Path -LiteralPath $path) { throw "Finish the active Git operation first: $name in $root" }
+    }
+    Assert-PublishStagedChanges $root
+    Assert-PublishLocalOnlyData $Target
+    Assert-F24I2cPublicContent $Target
+    foreach($relative in @($Target.RequiredFiles | Where-Object {$_})) {
+        $path=Join-Path $root $relative
+        Assert-PublishTree $root $path
+        if(!(Test-Path -LiteralPath $path -PathType Leaf) -or !(Get-Item -LiteralPath $path).Length) {
+            throw "Missing/empty required delivery: $relative in $root"
+        }
+    }
+    foreach($key in @('user.name','user.email')) {
+        if(!(Invoke-PublishGit $root @('config','--get',$key) @(0,1)).Text) { throw "Missing Git $key in $root" }
+    }
+    if($Target.ToolScope) { $Target.Dependencies=@(Get-PublishToolDependencies $Target) }
+    $Target.Root=$root
+    $Target.Head=(Invoke-PublishGit $root @('rev-parse','HEAD')).Text
+    $Target.Status=(Invoke-PublishGit $root @('status','--short','--untracked-files=all')).Text
+}
+
+function Assert-F24I2cPublicContent($Target) {
+    if($Target.Name -cnotin @('RL78_F24_I2C_Slave_Transfer','RL78_F24_ISP_Boot_loader_I2C','RL78_F24_ISP_Boot_loader_I2C_app')) { return }
+    $paths=(Invoke-PublishGit $Target.Root @('ls-files','--cached','--others','--exclude-standard','-z')).Text.Split([char]0)
+    foreach($path in $paths) {
+        if(!$path -or $path -notmatch '\.(?:c|h|asm|inc|md|ps1|bat|json|scfg|mtpj)$') { continue }
+        $file=Join-Path $Target.Root $path
+        if(!(Test-Path -LiteralPath $file -PathType Leaf)) { continue }
+        $text=[IO.File]::ReadAllText($file)
+        if($text -match '[A-Za-z]:[\\/](?:SourceCode|Users)[\\/]') {
+            throw "Private workspace path in F24 I2C publication input: $path"
+        }
+    }
+}
+
+function Assert-PublishAncestry($Targets) {
+    foreach($target in $Targets) {
+        $remote=(Invoke-PublishGit $target.Root @('ls-remote','--exit-code','origin','refs/heads/main') @(0,2))
+        if($remote.Code -eq 2) {
+            if((Invoke-PublishGit $target.Root @('ls-remote','origin')).Text) {
+                throw "Remote is not empty and has no main branch. Review before publishing: $($target.Name)"
+            }
+            if($target.ToolScope) {
+                foreach($path in (Invoke-PublishGit $target.Root @('log','--root','--format=','--name-only','--no-renames','-z','HEAD')).Text.Split([char]0)) {
+                    $path=$path.Trim("`r","`n")
+                    if($path -and !(Test-ToolPublicationPath $path)) { throw "Unvalidated/withheld content exists in outgoing Tool history: $path" }
+                }
+            }
+            Write-Host "Verified empty origin; initial main publication: $($target.Name)"
+            continue
+        }
+        [void](Invoke-PublishGit $target.Root @('fetch','--no-tags','origin','refs/heads/main'))
+        if((Invoke-PublishGit $target.Root @('merge-base','--is-ancestor','FETCH_HEAD','HEAD') @(0,1)).Code) {
+            throw "Remote main contains changes not in local main. Review/synchronize before publishing: $($target.Name)"
+        }
+        if($target.ToolScope) {
+            foreach($path in (Invoke-PublishGit $target.Root @('log','--format=','--name-only','--no-renames','-z','FETCH_HEAD..HEAD')).Text.Split([char]0)) {
+                $path=$path.Trim("`r","`n")
+                if($path -and !(Test-ToolPublicationPath $path)) { throw "Unvalidated/withheld content exists in outgoing Tool history: $path" }
+            }
+        }
+    }
+}

@@ -1,0 +1,24 @@
+# Keep the role-specific delivery; preserve other outputs locally.
+/DefaultBuild/*
+!/DefaultBuild/RL78_F24_ISP_Boot_loader_I2C_app_update.bin
+/tmp/
+/test_bins/
+*.mtud
+QualityReport*.txt
+/boot_app.bin
+/boot_app.hex
+*.rcpe
+
+# Private engineering state and reproducible compiler/cache outputs.
+/AGENTS.md
+/SELF_CHECK.md
+/HANDOFF.md
+/CODEX_HANDOFF.md
+/MANUAL_CLEANUP.md
+/docs/internal/
+/github_push.local.psd1
+*.obj
+*.pdb
+*.ilk
+__pycache__/
+*.pyc
